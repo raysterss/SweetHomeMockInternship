@@ -102,8 +102,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
 
 import javax.imageio.ImageIO;
 import javax.media.j3d.AmbientLight;
@@ -2004,10 +2007,100 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
   }
   
   /**
-   * Prints this component plan at the scale given in the home print attributes or at a scale 
-   * that makes it fill <code>pageFormat</code> imageable size if this attribute is <code>null</code>.
+   * Prints one fitted page for each viewable level, in home order. Homes without
+   * named levels retain their existing scale and pagination behavior.
    */
-  public int print(Graphics g, PageFormat pageFormat, int pageIndex) {
+  public int print(final Graphics g, final PageFormat pageFormat, final int pageIndex) {
+    if (!EventQueue.isDispatchThread()) {
+      FutureTask<Integer> task = new FutureTask<Integer>(new Callable<Integer>() {
+          public Integer call() {
+            return print(g, pageFormat, pageIndex);
+          }
+        });
+      EventQueue.invokeLater(task);
+      boolean interrupted = false;
+      try {
+        while (true) {
+          try {
+            int result = task.get();
+            if (interrupted) {
+              throw new RuntimeException("Plan printing interrupted");
+            }
+            return result;
+          } catch (InterruptedException ex) {
+            // Wait for the dispatch thread's finally blocks before reporting cancellation.
+            interrupted = true;
+          } catch (ExecutionException ex) {
+            if (ex.getCause() instanceof RuntimeException) {
+              throw (RuntimeException)ex.getCause();
+            }
+            throw (Error)ex.getCause();
+          }
+        }
+      } finally {
+        if (interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+    if (pageIndex < 0) {
+      return NO_SUCH_PAGE;
+    }
+    List<Level> printedLevels = getViewableLevels(this.home);
+    if (this.home.getLevels().isEmpty()) {
+      // Preserve the existing pagination of homes without named levels.
+      return printSelectedLevel(g, pageFormat, pageIndex, false);
+    }
+    if (pageIndex >= printedLevels.size()) {
+      return NO_SUCH_PAGE;
+    }
+    Level selectedLevel = this.home.getSelectedLevel();
+    List<Selectable> selectedItems = new ArrayList<Selectable>(this.home.getSelectedItems());
+    boolean allLevelsSelection = this.home.isAllLevelsSelection();
+    boolean modified = this.home.isModified();
+    Camera observerCamera = this.home.getObserverCamera().clone();
+    Camera topCamera = this.home.getTopCamera().clone();
+    List<Level> levels = this.home.getLevels();
+    boolean [] visibleLevels = new boolean [levels.size()];
+    for (int i = 0; i < levels.size(); i++) {
+      visibleLevels [i] = levels.get(i).isVisible();
+    }
+    try {
+      this.home.setSelectedLevel(printedLevels.get(pageIndex));
+      // Each viewable level occupies one fitted plan page, including an empty level.
+      printSelectedLevel(g, pageFormat, 0, true);
+      return PAGE_EXISTS;
+    } finally {
+      try {
+        this.home.setSelectedLevel(selectedLevel);
+      } finally {
+        // Selected-level listeners may alter selection, camera elevation and visibility.
+        this.home.setSelectedItems(selectedItems);
+        this.home.setAllLevelsSelection(allLevelsSelection);
+        for (int i = 0; i < levels.size(); i++) {
+          levels.get(i).setVisible(visibleLevels [i]);
+        }
+        this.home.getObserverCamera().setCamera(observerCamera);
+        this.home.getTopCamera().setCamera(topCamera);
+        this.home.setModified(modified);
+      }
+    }
+  }
+
+  /**
+   * Returns viewable levels in the order defined by the home.
+   */
+  static List<Level> getViewableLevels(Home home) {
+    List<Level> levels = new ArrayList<Level>();
+    for (Level level : home.getLevels()) {
+      if (level.isViewable()) {
+        levels.add(level);
+      }
+    }
+    return levels;
+  }
+
+  private int printSelectedLevel(Graphics g, PageFormat pageFormat, int pageIndex, boolean fitOnPage) {
     List<Selectable> printedItems = getPaintedItems(); 
     Rectangle2D printedItemBounds = getItemsBounds(g, printedItems);
     if (printedItemBounds != null) {
@@ -2020,7 +2113,7 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
       float columnIndex;
       int pagesPerRow;
       int pagesPerColumn;
-      if (this.home.getPrint() == null || this.home.getPrint().getPlanScale() == null) {
+      if (fitOnPage || this.home.getPrint() == null || this.home.getPrint().getPlanScale() == null) {
         // Compute a scale that ensures the plan will fill the component if plan scale is null
         printScale = getPrintPreferredScale(g, pageFormat) * LengthUnit.centimeterToInch(72);
         if (pageIndex > 0) {
@@ -2049,26 +2142,29 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
       }
           
       Graphics2D g2D = (Graphics2D)g.create();
-      g2D.clip(new Rectangle2D.Double(imageableX, imageableY, imageableWidth, imageableHeight));
-      // Change coordinates system to paper imageable origin
-      g2D.translate(imageableX - columnIndex * imageableWidth, imageableY - rowIndex * imageableHeight);
-      g2D.scale(printScale, printScale);
-      float extraMargin = getStrokeWidthExtraMargin(printedItems, PaintMode.PRINT);
-      g2D.translate(-printedItemBounds.getMinX() + extraMargin,
-          -printedItemBounds.getMinY() + extraMargin);
-      // Center plan in component if possible
-      g2D.translate(Math.max(0, 
-              (imageableWidth * pagesPerRow / printScale - printedItemBounds.getWidth() - 2 * extraMargin) / 2), 
-          Math.max(0, 
-              (imageableHeight * pagesPerColumn / printScale - printedItemBounds.getHeight() - 2 * extraMargin) / 2));
-      setRenderingHints(g2D);
       try {
-        // Print component contents
-        paintContent(g2D, printScale, PaintMode.PRINT);
-      } catch (InterruptedIOException ex) {
-        // Ignore exception because it may happen only in EXPORT paint mode 
-      }   
-      g2D.dispose();
+        g2D.clip(new Rectangle2D.Double(imageableX, imageableY, imageableWidth, imageableHeight));
+        // Change coordinates system to paper imageable origin
+        g2D.translate(imageableX - columnIndex * imageableWidth, imageableY - rowIndex * imageableHeight);
+        g2D.scale(printScale, printScale);
+        float extraMargin = getStrokeWidthExtraMargin(printedItems, PaintMode.PRINT);
+        g2D.translate(-printedItemBounds.getMinX() + extraMargin,
+            -printedItemBounds.getMinY() + extraMargin);
+        // Center plan in component if possible
+        g2D.translate(Math.max(0,
+                (imageableWidth * pagesPerRow / printScale - printedItemBounds.getWidth() - 2 * extraMargin) / 2),
+            Math.max(0,
+                (imageableHeight * pagesPerColumn / printScale - printedItemBounds.getHeight() - 2 * extraMargin) / 2));
+        setRenderingHints(g2D);
+        try {
+          // Print component contents
+          paintContent(g2D, printScale, PaintMode.PRINT);
+        } catch (InterruptedIOException ex) {
+          // Ignore exception because it may happen only in EXPORT paint mode
+        }
+      } finally {
+        g2D.dispose();
+      }
       return PAGE_EXISTS;
     } else {
       return NO_SUCH_PAGE;

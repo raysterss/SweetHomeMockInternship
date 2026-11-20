@@ -39,6 +39,7 @@ import java.security.AccessControlException;
 import java.text.MessageFormat;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.List;
 import java.util.MissingResourceException;
 import java.util.ResourceBundle;
 import java.util.Set;
@@ -47,7 +48,6 @@ import javax.swing.JComponent;
 import javax.swing.JLabel;
 
 import com.eteks.sweethome3d.model.Home;
-import com.eteks.sweethome3d.model.HomePieceOfFurniture;
 import com.eteks.sweethome3d.model.HomePrint;
 import com.eteks.sweethome3d.model.LengthUnit;
 import com.eteks.sweethome3d.model.Level;
@@ -123,6 +123,8 @@ public class HomePrintableComponent extends JComponent implements Printable {
   private final Font           headerFooterFont;
   private int                  page;
   private int                  pageCount = -1;
+  private PageFormat           paginationFormat;
+  private boolean              countingPages;
   private Set<Integer>         printablePages = new HashSet<Integer>();
   private int                  furniturePageCount;
   private int                  planPageCount;
@@ -182,6 +184,27 @@ public class HomePrintableComponent extends JComponent implements Printable {
    * Prints a given <code>page</code>.
    */
   public int print(Graphics g, PageFormat pageFormat, int page) throws PrinterException {
+    if (Thread.interrupted()) {
+      throw new InterruptedPrinterException();
+    }
+    if (page < 0) {
+      return NO_SUCH_PAGE;
+    }
+    // Printable clients may request pages out of order. Establish section offsets first.
+    if (!this.countingPages && (this.pageCount == -1 || !samePageFormat(pageFormat, this.paginationFormat))) {
+      countPages(pageFormat);
+    }
+    Paper paper = pageFormat.getPaper();
+    Graphics copy = g.create();
+    try {
+      return printPage(copy, pageFormat, page);
+    } finally {
+      copy.dispose();
+      pageFormat.setPaper(paper);
+    }
+  }
+
+  private int printPage(Graphics g, PageFormat pageFormat, int page) throws PrinterException {
     // Check current thread isn't interrupted
     if (Thread.interrupted()) {
       throw new InterruptedPrinterException();
@@ -257,7 +280,7 @@ public class HomePrintableComponent extends JComponent implements Printable {
         int pageNumber = page + 1; 
         int pageCount = getPageCount(); 
         String planScale = "?";
-        if (homePrint.getPlanScale() != null) {
+        if (homePrint.getPlanScale() != null && this.home.getLevels().isEmpty()) {
           planScale = "1/" + Math.round(1 / homePrint.getPlanScale());
         } else {
           Float preferredScale = null;
@@ -279,7 +302,12 @@ public class HomePrintableComponent extends JComponent implements Printable {
           homeName = "";
         }
         String levelName = "";
-        if (this.home.getSelectedLevel() != null) {
+        List<Level> printedLevels = PlanComponent.getViewableLevels(this.home);
+        int planPage = page - this.furniturePageCount;
+        if (homePrint.isPlanPrinted() && planPage >= 0 && planPage < printedLevels.size()) {
+          levelName = printedLevels.get(planPage).getName();
+        } else if (page >= this.furniturePageCount + this.planPageCount
+            && this.home.getSelectedLevel() != null) {
           levelName = this.home.getSelectedLevel().getName();
         }
         String homePresentationName = this.controller.getContentManager().getPresentationName(
@@ -345,32 +373,9 @@ public class HomePrintableComponent extends JComponent implements Printable {
     View furnitureView = this.controller.getFurnitureController().getView();
     if (furnitureView != null 
         && (homePrint == null || homePrint.isFurniturePrinted())) {
-      FurnitureTable furnitureTable = null;
-      final FurnitureTable.FurnitureFilter furnitureFilter;
-      if (furnitureView instanceof FurnitureTable
-          && (homePrint == null
-              || homePrint.isPlanPrinted()
-              || homePrint.isView3DPrinted())) {
-        final Level selectedLevel = home.getSelectedLevel();
-        furnitureTable = (FurnitureTable)furnitureView;
-        furnitureFilter = furnitureTable.getFurnitureFilter();
-        furnitureTable.setFurnitureFilter(new FurnitureTable.FurnitureFilter() {
-            public boolean include(Home home, HomePieceOfFurniture piece) {
-              // Print only furniture at selected level when the plan or the 3D view is printed
-              return (furnitureFilter == null || furnitureFilter.include(home, piece))
-                  && piece.isAtLevel(selectedLevel)
-                  && (piece.getLevel() == null || piece.getLevel().isViewable());
-            }
-          });
-      } else {
-        furnitureFilter = null;
-      }
-      // Try to print next furniture view page      
+      // FurnitureTable already filters non-viewable levels and honors its current filter.
+      // Do not restrict the printed rows to the currently selected level.
       pageExists = ((Printable)furnitureView).print(g2D, pageFormat, page);
-      if (furnitureTable != null) {
-        // Restore previous filter
-        ((FurnitureTable)furnitureView).setFurnitureFilter(furnitureFilter);
-      }
       if (pageExists == PAGE_EXISTS
           && !this.printablePages.contains(page)) {
         this.printablePages.add(page);
@@ -481,22 +486,50 @@ public class HomePrintableComponent extends JComponent implements Printable {
    */
   public int getPageCount() {
     if (this.pageCount == -1) {
-      PageFormat pageFormat = getPageFormat(this.home.getPrint());
-      BufferedImage dummyImage = new BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB);
-      Graphics dummyGraphics = dummyImage.getGraphics();
-      // Count pages by printing in a dummy image
-      this.pageCount = 0; 
-      try {
-        while (print(dummyGraphics, pageFormat, this.pageCount) == Printable.PAGE_EXISTS) {
-          this.pageCount++;
-        }
-      } catch (PrinterException ex) {
-        // There should be no reason that print fails if print is done on a dummy image
-        throw new RuntimeException(ex);
-      }
-      dummyGraphics.dispose();
+      countPages(getPageFormat(this.home.getPrint()));
     }
     return this.pageCount;
+  }
+
+  private static boolean samePageFormat(PageFormat first, PageFormat second) {
+    return second != null
+        && first.getOrientation() == second.getOrientation()
+        && first.getWidth() == second.getWidth() && first.getHeight() == second.getHeight()
+        && first.getImageableX() == second.getImageableX() && first.getImageableY() == second.getImageableY()
+        && first.getImageableWidth() == second.getImageableWidth()
+        && first.getImageableHeight() == second.getImageableHeight();
+  }
+
+  private void countPages(PageFormat requestedFormat) {
+    PageFormat pageFormat = (PageFormat)requestedFormat.clone();
+    BufferedImage dummyImage = new BufferedImage(1, 1, BufferedImage.TYPE_INT_RGB);
+    Graphics dummyGraphics = dummyImage.getGraphics();
+    // Count pages at the caller's paper size before mapping section offsets.
+    this.paginationFormat = (PageFormat)requestedFormat.clone();
+    this.pageCount = 0;
+    this.furniturePageCount = 0;
+    this.planPageCount = 0;
+    this.printablePages.clear();
+    this.countingPages = true;
+    boolean counted = false;
+    try {
+      while (print(dummyGraphics, pageFormat, this.pageCount) == Printable.PAGE_EXISTS) {
+        this.pageCount++;
+      }
+      counted = true;
+    } catch (PrinterException ex) {
+      throw new RuntimeException(ex);
+    } finally {
+      dummyGraphics.dispose();
+      this.countingPages = false;
+      if (!counted) {
+        this.pageCount = -1;
+        this.paginationFormat = null;
+        this.furniturePageCount = 0;
+        this.planPageCount = 0;
+        this.printablePages.clear();
+      }
+    }
   }
 
   /**
