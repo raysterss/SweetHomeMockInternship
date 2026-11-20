@@ -42,7 +42,6 @@ import java.io.IOException;
 import java.io.StringWriter;
 import java.io.Writer;
 import java.lang.ref.WeakReference;
-import java.lang.reflect.InvocationTargetException;
 import java.math.BigDecimal;
 import java.text.DecimalFormat;
 import java.text.Format;
@@ -58,6 +57,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 
 import javax.swing.BorderFactory;
 import javax.swing.Icon;
@@ -132,6 +134,8 @@ public class FurnitureTable extends JTable implements View, Printable {
   private Popup                  furnitureInformationPopup;
   private AWTEventListener       informationPopupRemovalListener;
 
+  private final FurnitureTableColumnModel furnitureColumnModel;
+
   /**
    * Creates a table that displays furniture of <code>home</code>.
    * @param home        the home displayed by this view
@@ -154,7 +158,8 @@ public class FurnitureTable extends JTable implements View, Printable {
       setRowHeight(Math.round(getRowHeight() * resolutionScale));
     }
     setModel(new FurnitureTreeTableModel(home));
-    setColumnModel(new FurnitureTableColumnModel(home, preferences));
+    this.furnitureColumnModel = new FurnitureTableColumnModel(home, preferences);
+    setColumnModel(this.furnitureColumnModel);
     updateTableColumnsWidth(0);
     updateExpandedRows(home);
     updateTableSelectedFurniture(home);
@@ -750,8 +755,16 @@ public class FurnitureTable extends JTable implements View, Printable {
           return headerRendererLabel;
         }
       };
-    for (int columnIndex = 0, n = columnModel.getColumnCount(); columnIndex < n; columnIndex++) {
-      final TableColumn tableColumn = columnModel.getColumn(columnIndex);
+    List<TableColumn> printedColumns = Collections.list(columnModel.getColumns());
+    boolean levelColumnVisible = false;
+    for (TableColumn column : printedColumns) {
+      levelColumnVisible |= column.getIdentifier() == HomePieceOfFurniture.SortableProperty.LEVEL;
+    }
+    if (!levelColumnVisible) {
+      // Add Level to the print copy only, without changing the home's visible properties.
+      printedColumns.add(this.furnitureColumnModel.availableColumns.get(HomePieceOfFurniture.SortableProperty.LEVEL));
+    }
+    for (final TableColumn tableColumn : printedColumns) {
       // Create a printable column from existing table column
       TableColumn printableColumn = new TableColumn();
       printableColumn.setIdentifier(tableColumn.getIdentifier());
@@ -793,52 +806,52 @@ public class FurnitureTable extends JTable implements View, Printable {
     if (EventQueue.isDispatchThread()) {
       TableColumnModel oldColumnModel = getColumnModel();
       Color oldGridColor = getGridColor();
-      setColumnModel(printableColumnModel);   
-      if (OperatingSystem.isWindows()) {
-        // Add 3 pixels to columns to get a correct rendering
-        updateTableColumnsWidth(3);
-      } else {
-        updateTableColumnsWidth(0);
-      }
-      setGridColor(gridColor);
-      Printable printable = getPrintable(PrintMode.FIT_WIDTH, null, null);
-      int pageExists = printable.print(g, pageFormat, pageIndex);
-      // Restore column model and grid color to their previous values
-      setColumnModel(oldColumnModel);
-      setGridColor(oldGridColor);
-      return pageExists;
-    } else {
-      // Print synchronously table in Event Dispatch Thread
-      // The best solution should be to be able to print out of Event Dispatch Thread
-      // a new instance of JTable customized with printableColumnModel and gridColor,
-      // but Swing refuses to print a JTable that isn't attached to a visible frame
-      class RunnableContext {
-        int pageExists;
-        PrinterException exception;
-      }
-      
-      final RunnableContext context = new RunnableContext();
       try {
-        EventQueue.invokeAndWait(new Runnable() {
-            public void run() {
-              try {
-                context.pageExists = print(g, pageFormat, pageIndex, printableColumnModel, gridColor);
-              } catch (PrinterException ex) {
-                context.exception = ex;
-              }
-            }
-          });
-        if (context.exception != null) {
-          throw context.exception;
-        }
-        return context.pageExists;
-      } catch (InterruptedException ex) {
-        throw new InterruptedPrinterException("Print interrupted");
-      } catch (InvocationTargetException ex) {
-        if (ex.getCause() instanceof RuntimeException) {
-          throw (RuntimeException)ex.getCause();
+        setColumnModel(printableColumnModel);
+        if (OperatingSystem.isWindows()) {
+          // Add 3 pixels to columns to get a correct rendering.
+          updateTableColumnsWidth(3);
         } else {
-          throw (Error)ex.getCause();
+          updateTableColumnsWidth(0);
+        }
+        setGridColor(gridColor);
+        Printable printable = getPrintable(PrintMode.FIT_WIDTH, null, null);
+        return printable.print(g, pageFormat, pageIndex);
+      } finally {
+        setColumnModel(oldColumnModel);
+        setGridColor(oldGridColor);
+      }
+    } else {
+      FutureTask<Integer> task = new FutureTask<Integer>(new Callable<Integer>() {
+          public Integer call() throws PrinterException {
+            return print(g, pageFormat, pageIndex, printableColumnModel, gridColor);
+          }
+        });
+      EventQueue.invokeLater(task);
+      boolean interrupted = false;
+      try {
+        while (true) {
+          try {
+            int result = task.get();
+            if (interrupted) {
+              throw new InterruptedPrinterException("Print interrupted");
+            }
+            return result;
+          } catch (InterruptedException ex) {
+            // Do not return while the print-only column model is still installed.
+            interrupted = true;
+          } catch (ExecutionException ex) {
+            if (ex.getCause() instanceof PrinterException) {
+              throw (PrinterException)ex.getCause();
+            } else if (ex.getCause() instanceof RuntimeException) {
+              throw (RuntimeException)ex.getCause();
+            }
+            throw (Error)ex.getCause();
+          }
+        }
+      } finally {
+        if (interrupted) {
+          Thread.currentThread().interrupt();
         }
       }
     }
